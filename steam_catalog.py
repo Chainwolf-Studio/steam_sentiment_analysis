@@ -46,14 +46,18 @@ import argparse
 import json
 import locale
 import os
+import re
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 from email.utils import parsedate_to_datetime
+from html import unescape
 from pathlib import Path
 
 try:
@@ -79,17 +83,21 @@ class Client:
     def __init__(self, delay):
         self.delay = delay
         self.next_request = 0.0
+        self.request_lock = threading.Lock()
 
-    def get(self, url, params):
+    def get(self, url, params, *, page=False):
         request = urllib.request.Request(
             url + "?" + urllib.parse.urlencode(params),
             headers={"User-Agent": "SteamCatalogResearch/1.0"})
         for attempt in range(5):
-            time.sleep(max(0, self.next_request - time.monotonic()))
-            self.next_request = time.monotonic() + self.delay
+            with self.request_lock:
+                time.sleep(max(0, self.next_request - time.monotonic()))
+                self.next_request = time.monotonic() + self.delay
             wait = 2 ** (attempt + 1)
             try:
                 with urllib.request.urlopen(request, timeout=40) as response:
+                    if page:
+                        return response.geturl(), response.read().decode("utf-8", errors="replace")
                     return json.load(response)
             except urllib.error.HTTPError as error:
                 if error.code not in (429, 500, 502, 503, 504):
@@ -104,6 +112,9 @@ class Client:
                                          - datetime.now(timezone.utc)).total_seconds())
                     except (ValueError, TypeError, OverflowError):
                         pass
+                if error.code == 429:
+                    with self.request_lock:
+                        self.next_request = max(self.next_request, time.monotonic() + wait)
             except (urllib.error.URLError, TimeoutError, OSError, ValueError):
                 pass
             if attempt < 4:
@@ -118,6 +129,8 @@ def open_database(path, country):
     db.execute("""CREATE TABLE IF NOT EXISTS apps (
         appid INTEGER PRIMARY KEY, name TEXT, active INTEGER DEFAULT 1,
         state TEXT DEFAULT 'pending', payload TEXT, error TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS disclosures (
+        appid INTEGER PRIMARY KEY, status TEXT NOT NULL, text TEXT)""")
     saved = db.execute("SELECT value FROM settings WHERE key='country'").fetchone()
     if saved and saved[0] != country:
         raise RuntimeError("Folosește o bază --db separată pentru altă țară")
@@ -248,15 +261,70 @@ def collect_batches(db, client, pending, country):
         print(f"[{start + len(appids)}/{len(pending)}] AppID-uri verificate în loturi.", flush=True)
 
 
-def export_xlsx(db, output, since=None):
+def disclosure_from_page(appid, url, html):
+    path = urllib.parse.urlsplit(url).path
+    if not re.match(rf"/app/{appid}(?:/|$)", path) or "apphub_AppName" not in html:
+        return "error", None
+    section = re.search(
+        r'<h2\b[^>]*>\s*AI Generated Content Disclosure\s*</h2>(.*?)</div\s*>',
+        html, re.IGNORECASE | re.DOTALL)
+    if not section:
+        if re.search(r'<h2\b[^>]*>\s*AI Generated Content Disclosure\s*</h2>', html, re.I):
+            return "error", None
+        return "absent", None
+    body = re.search(r'<i\b[^>]*>(.*?)</i\s*>', section[1], re.I | re.S)
+    if body:
+        text = body[1]
+    else:
+        text = re.sub(r'<p\b[^>]*>\s*The developers describe[^<]*</p>', '', section[1], flags=re.I)
+    text = re.sub(r'<br\s*/?>|</p\s*>', '\n', text, flags=re.I)
+    text = unescape(re.sub(r'<[^>]+>', '', text))
+    return "present", '\n'.join(line.strip() for line in text.splitlines()).strip()
+
+
+def collect_disclosures(db, client, country, since, retry_errors):
+    pending = db.execute("""SELECT apps.appid FROM apps
+        LEFT JOIN disclosures ON disclosures.appid=apps.appid
+        WHERE apps.active=1 AND apps.payload IS NOT NULL
+          AND json_extract(apps.payload, '$.release_date') >= ?
+          AND (disclosures.appid IS NULL OR (? AND disclosures.status='error'))
+        ORDER BY apps.appid""", (since.isoformat(), retry_errors)).fetchall()
+    print(f"Declarații AI: {len(pending)} pagini de verificat.", flush=True)
+    def inspect(appid):
+        try:
+            url, html = client.get(f"https://store.steampowered.com/app/{appid}/",
+                                   {"l": "english", "cc": country}, page=True)
+            status, text = disclosure_from_page(appid, url, html)
+        except RuntimeError as error:
+            if str(error) not in ("HTTP 403", "HTTP 404", "HTTP 451"):
+                raise
+            status, text = "error", None
+        return appid, status, text
+
+    workers = ThreadPoolExecutor(max_workers=4)
+    try:
+        for start in range(0, len(pending), 100):
+            batch = pending[start:start + 100]
+            for record in workers.map(inspect, (appid for (appid,) in batch)):
+                with db:
+                    db.execute("INSERT OR REPLACE INTO disclosures VALUES (?, ?, ?)", record)
+            print(f"[{start + len(batch)}/{len(pending)}] Declarații AI verificate.", flush=True)
+    finally:
+        workers.shutdown(wait=False, cancel_futures=True)
+    print("Stări declarații AI:", dict(db.execute(
+        "SELECT status, COUNT(*) FROM disclosures GROUP BY status")), flush=True)
+
+
+def export_xlsx(db, output, since=None, ai_only=False):
     workbook = Workbook(write_only=True)
     sheet = workbook.create_sheet("Jocuri Steam")
     sheet.freeze_panes = "A2"
-    for column, width in enumerate((12, 42, 16, 22, 18, 19, 19, 47, 11, 30, 19), 1):
+    fields = FIELDS + ["ai_disclosure"] if ai_only else FIELDS
+    for column, width in enumerate((12, 42, 16, 22, 18, 19, 19, 47, 11, 30, 19, 90)[:len(fields)], 1):
         sheet.column_dimensions[get_column_letter(column)].width = width
 
     headers = []
-    for field in FIELDS:
+    for field in fields:
         cell = WriteOnlyCell(sheet, value=field)
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill(fill_type="solid", fgColor="17476B")
@@ -264,14 +332,17 @@ def export_xlsx(db, output, since=None):
     sheet.append(headers)
 
     last_row = 1
-    for (payload,) in db.execute(
-            "SELECT payload FROM apps WHERE active=1 AND payload IS NOT NULL ORDER BY appid"):
+    for payload, disclosure in db.execute("""SELECT apps.payload, disclosures.text FROM apps
+            LEFT JOIN disclosures ON disclosures.appid=apps.appid
+            WHERE apps.active=1 AND apps.payload IS NOT NULL
+              AND (?=0 OR disclosures.status='present') ORDER BY apps.appid""", (ai_only,)):
         row = json.loads(payload)
+        row["ai_disclosure"] = disclosure
         release_date = row.get("release_date")
         if since and (not release_date or date.fromisoformat(release_date) < since):
             continue
         cells = []
-        for field in FIELDS:
+        for field in fields:
             value = row.get(field)
             if field == "release_date" and value:
                 cell = WriteOnlyCell(sheet, value=date.fromisoformat(value))
@@ -284,7 +355,7 @@ def export_xlsx(db, output, since=None):
             cells.append(cell)
         sheet.append(cells)
         last_row += 1
-    sheet.auto_filter.ref = f"A1:{get_column_letter(len(FIELDS))}{last_row}"
+    sheet.auto_filter.ref = f"A1:{get_column_letter(len(fields))}{last_row}"
 
     temp = output.with_suffix(".tmp.xlsx")
     try:
@@ -302,6 +373,7 @@ def main():
     parser.add_argument("--delay", type=float, default=2.0)
     parser.add_argument("--limit", type=int, default=0, help="0 = fără limită")
     parser.add_argument("--fast", action="store_true", help="Metadate și recenzii din magazin în loturi")
+    parser.add_argument("--ai-only", action="store_true", help="Verifică și exportă doar jocurile cu declarație AI")
     parser.add_argument("--since", type=date.fromisoformat, metavar="YYYY-MM-DD",
                         help="Data minimă de lansare pentru export (inclusiv)")
     parser.add_argument("--retry-errors", action="store_true")
@@ -312,6 +384,8 @@ def main():
         parser.error("--delay și --limit trebuie să fie >= 0")
     if args.output.suffix.lower() != ".xlsx":
         parser.error("--output trebuie să aibă extensia .xlsx")
+    if args.ai_only and (not args.fast or args.since is None):
+        parser.error("--ai-only necesită --fast și --since")
     locale.setlocale(locale.LC_TIME, "C")
     db = open_database(args.db, args.country.lower())
     try:
@@ -333,6 +407,8 @@ def main():
             pending = pending[:args.limit]
         if args.fast:
             collect_batches(db, client, pending, args.country.lower())
+            if args.ai_only:
+                collect_disclosures(db, client, args.country.lower(), args.since, args.retry_errors)
             return
         for index, (appid,) in enumerate(pending, 1):
             try:
@@ -348,7 +424,7 @@ def main():
             print(f"[{index}/{len(pending)}] AppID {appid}: {state}", flush=True)
     finally:
         try:
-            export_xlsx(db, args.output, args.since)
+            export_xlsx(db, args.output, args.since, args.ai_only)
             print("Stare:", dict(db.execute("SELECT state,COUNT(*) FROM apps WHERE active=1 GROUP BY state")))
             print(f"Fișier Excel salvat în {args.output.resolve()}")
         finally:
