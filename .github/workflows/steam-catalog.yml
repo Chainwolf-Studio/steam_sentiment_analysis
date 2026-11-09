@@ -44,7 +44,7 @@ jobs:
           mkdir -p output
           status=0
           timeout --preserve-status --signal=INT --kill-after=120s 325m \
-            python -u steam_catalog.py --fast --since 2024-01-01 \
+            python -u steam_catalog.py --fast --since 2024-01-01 --ai-only --delay 0.25 \
             --db output/steam_progress.sqlite3 --output output/steam_games.xlsx || status=$?
           if [ "$status" -eq 130 ]; then
             echo "Colectare întreruptă. Descarcă progresul sau reia cu ID-ul acestei rulări." >> "$GITHUB_STEP_SUMMARY"
