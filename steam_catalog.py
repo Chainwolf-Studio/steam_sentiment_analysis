@@ -296,8 +296,11 @@ def collect_disclosures(db, client, country, since, retry_errors):
                                    {"l": "english", "cc": country}, page=True)
             status, text = disclosure_from_page(appid, url, html)
         except RuntimeError as error:
-            if str(error) not in ("HTTP 403", "HTTP 404", "HTTP 451"):
+            # urllib raises an HTTP error when a redirect cannot be followed.
+            if str(error) not in ("HTTP 301", "HTTP 302", "HTTP 303", "HTTP 307", "HTTP 308",
+                                  "HTTP 403", "HTTP 404", "HTTP 451"):
                 raise
+            print(f"AppID {appid}: pagină inaccesibilă ({error}).", flush=True)
             status, text = "error", None
         return appid, status, text
 
