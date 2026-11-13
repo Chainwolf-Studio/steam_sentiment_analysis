@@ -1,0 +1,54 @@
+name: Steam Next Fest — recenzii jocuri filtrate
+
+on:
+  workflow_dispatch:
+    inputs:
+      resume_run_id:
+        description: "ID-ul unei rulări anterioare pentru reluare (opțional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: steam-next-fest-reviews
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Instalează dependențele
+        run: python -m pip install openpyxl==3.1.5
+      - name: Recuperează progresul anterior
+        if: inputs.resume_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: steam-next-fest-filtered-reviews
+          run-id: ${{ inputs.resume_run_id }}
+          github-token: ${{ github.token }}
+          path: review_output
+      - name: Colectează recenziile
+        run: |
+          timeout --preserve-status --signal=INT --kill-after=90s 170m \
+            python -u steam_reviews.py
+      - name: Salvează CSV-urile și progresul
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: steam-next-fest-filtered-reviews
+          path: |
+            review_output/reviews.csv
+            review_output/games.csv
+            review_output/reviews.sqlite3
+          if-no-files-found: warn
+          retention-days: 14
