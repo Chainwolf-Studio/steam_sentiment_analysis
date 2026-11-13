@@ -38,7 +38,9 @@ necesită o cheie API Steam.
   (`positive` sau `negative`). Genurile multiple sunt delimitate cu ` | `.
 - `games.csv` arată progresul pentru fiecare joc, inclusiv jocurile fără
   recenzii. `expected_reviews` este valoarea `total_matching` raportată de
-  Steam la începutul paginării. O diferență este marcată ca `count_mismatch`.
+  Steam la începutul paginării. `final_reported_reviews` este valoarea de la
+  final, comparată cu numărul de recenzii unice colectate. O diferență la
+  final este marcată ca `count_mismatch`.
 - `reviews.sqlite3` păstrează textul original și progresul după fiecare pagină.
   În CSV, valorile ce ar putea fi interpretate ca formule primesc un apostrof
   la început.

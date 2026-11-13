@@ -56,9 +56,13 @@ def collect_reviews(db, client, appid, cursor, expected):
         if not reviews:
             with db:
                 count = db.execute("SELECT COUNT(*) FROM reviews WHERE appid=?", (appid,)).fetchone()[0]
-                status = "complete" if count == expected else "count_mismatch"
-                db.execute("UPDATE games SET review_status=?, expected_reviews=? WHERE appid=?",
-                           (status, expected, appid))
+                final_count = response["total_matching"]
+                if type(final_count) is not int or final_count < 0:
+                    raise ValueError("Număr final de recenzii invalid")
+                status = "complete" if count == final_count else "count_mismatch"
+                db.execute("""UPDATE games SET review_status=?, expected_reviews=?,
+                              final_reported_reviews=? WHERE appid=?""",
+                           (status, expected, final_count, appid))
             return status
 
         next_cursor = response["cursor"]
@@ -109,7 +113,7 @@ def export(db, output):
         """))
     write_csv(output / "games.csv", db.execute("""
         SELECT g.appid, g.name, g.genres, g.genre_status, g.review_status,
-               g.expected_reviews, COUNT(r.review_id) AS collected_reviews
+               g.expected_reviews, g.final_reported_reviews, COUNT(r.review_id) AS collected_reviews
         FROM games g LEFT JOIN reviews r USING(appid) GROUP BY g.appid ORDER BY g.appid
         """))
 
@@ -133,12 +137,16 @@ def main():
                 appid INTEGER PRIMARY KEY, name TEXT, genres TEXT,
                 genre_status TEXT NOT NULL DEFAULT 'pending',
                 review_status TEXT NOT NULL DEFAULT 'pending',
-                cursor TEXT NOT NULL DEFAULT '*', expected_reviews INTEGER);
+                cursor TEXT NOT NULL DEFAULT '*', expected_reviews INTEGER,
+                final_reported_reviews INTEGER);
             CREATE TABLE IF NOT EXISTS reviews (
                 appid INTEGER NOT NULL, review_id TEXT NOT NULL,
                 valence TEXT NOT NULL, language TEXT, created_at_unix INTEGER NOT NULL,
                 review_text TEXT NOT NULL, PRIMARY KEY(appid, review_id));
             """)
+        if "final_reported_reviews" not in {column[1] for column in db.execute("PRAGMA table_info(games)")}:
+            with db:
+                db.execute("ALTER TABLE games ADD COLUMN final_reported_reviews INTEGER")
         config = json.dumps({"appids": sorted(appids), "country": country})
         saved = db.execute("SELECT value FROM settings").fetchone()
         if saved and saved[0] != config:
@@ -163,18 +171,24 @@ def main():
                         print(f"AppID {appid} · genuri: {error}", flush=True)
                 if review_status != "complete":
                     if review_status == "count_mismatch":
+                        try:
+                            review_status = collect_reviews(db, client, appid, cursor, expected)
+                        except errors as error:
+                            print(f"AppID {appid} · verificare finală: {error}", flush=True)
+                    if review_status == "count_mismatch":
                         with db:
                             db.execute("DELETE FROM reviews WHERE appid=?", (appid,))
                             db.execute("""UPDATE games SET cursor='*', expected_reviews=NULL,
-                                          review_status='pending' WHERE appid=?""", (appid,))
+                                          final_reported_reviews=NULL, review_status='pending' WHERE appid=?""", (appid,))
                         cursor, expected = "*", None
-                    try:
-                        review_status = collect_reviews(db, client, appid, cursor, expected)
-                    except errors as error:
-                        review_status = "error"
-                        with db:
-                            db.execute("UPDATE games SET review_status='error' WHERE appid=?", (appid,))
-                        print(f"AppID {appid} · recenzii: {error}", flush=True)
+                    if review_status != "complete":
+                        try:
+                            review_status = collect_reviews(db, client, appid, cursor, expected)
+                        except errors as error:
+                            review_status = "error"
+                            with db:
+                                db.execute("UPDATE games SET review_status='error' WHERE appid=?", (appid,))
+                            print(f"AppID {appid} · recenzii: {error}", flush=True)
                 print(f"[{index}/{len(appids)}] AppID {appid}: {review_status}", flush=True)
         finally:
             export(db, args.output_dir)
