@@ -219,16 +219,20 @@ def collect_app(client, appid, country):
         return "review_error", row
 
 
+def store_items(client, appids, country):
+    result = client.get("https://api.steampowered.com/IStoreBrowseService/GetItems/v1/", {
+        "input_json": json.dumps({
+            "ids": [{"appid": appid} for appid in appids],
+            "context": {"language": "english", "country_code": country.upper()},
+            "data_request": {"include_release": True, "include_reviews": True},
+        }, separators=(",", ":"))})
+    return {item["id"]: item for item in result["response"]["store_items"]}
+
+
 def collect_batches(db, client, pending, country):
     for start in range(0, len(pending), 100):
         appids = [appid for (appid,) in pending[start:start + 100]]
-        result = client.get("https://api.steampowered.com/IStoreBrowseService/GetItems/v1/", {
-            "input_json": json.dumps({
-                "ids": [{"appid": appid} for appid in appids],
-                "context": {"language": "english", "country_code": country.upper()},
-                "data_request": {"include_release": True, "include_reviews": True},
-            }, separators=(",", ":"))})
-        items = {item["id"]: item for item in result["response"]["store_items"]}
+        items = store_items(client, appids, country)
         collected = now()
         updates = []
         for appid in appids:
