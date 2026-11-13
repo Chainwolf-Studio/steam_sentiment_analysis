@@ -1,6 +1,8 @@
 name: Steam Next Fest — October 2026
 
 on:
+  push:
+    branches: [codex/run-steam-next-fest-october-2026]
   workflow_dispatch:
     inputs:
       resume_run_id:
